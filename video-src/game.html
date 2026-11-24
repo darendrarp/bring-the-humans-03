@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BOUNTY RUSH — an agent-built arcade game</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #191419; overflow: hidden; }
+  canvas { display: block; width: 1080px; height: 1920px; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+"use strict";
+// BOUNTY RUSH — a tiny vertical arcade game built fresh in this session for
+// the bring-the-humans-03 TikTok ad. A rocket ship (the agent) catches
+// falling $ coins and dodges red X bugs. Deterministic: fixed seed, fixed
+// timestep, autopilot. No network, no external assets, canvas-drawn only.
+const W = 1080, H = 1920;
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+
+// --- deterministic RNG (mulberry32) ---
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(20261124);
+
+// --- state ---
+const SHIP_Y = 1600;
+const sim = {
+  t: 0, score: 0, shields: 3, coins: 0, bugsDodged: 0,
+  shipX: W / 2, invuln: 0, shake: 0, over: false, overT: 0,
+  coinTimer: 0.4, bugTimer: 1.3,
+};
+const coins = [];   // {x, y, r, spin}
+const bugs = [];    // {x, y, r, sway, phase}
+const sparks = [];  // {x, y, vx, vy, life}
+const stars = [];
+for (let i = 0; i < 110; i++) {
+  stars.push({ x: rand() * W, y: rand() * H, r: 1 + rand() * 2.2, s: 12 + rand() * 30 });
+}
+
+function spawnCoin() {
+  coins.push({ x: 90 + rand() * (W - 180), y: -40, r: 34, spin: rand() * Math.PI });
+}
+function spawnBug() {
+  bugs.push({ x: 90 + rand() * (W - 180), y: -50, r: 40, sway: 30 + rand() * 50, phase: rand() * Math.PI * 2 });
+}
+
+// --- autopilot: chase the lowest coin, dodge a bug closing in ---
+function autopilot(dt) {
+  let target = sim.shipX;
+  let bestY = -1;
+  for (const c of coins) {
+    if (c.y > bestY && c.y < SHIP_Y - 40) { bestY = c.y; target = c.x; }
+  }
+  for (const b of bugs) {
+    const dy = SHIP_Y - b.y;
+    if (dy > 0 && dy < 430 && Math.abs(b.x - sim.shipX) < 150) {
+      target = b.x < sim.shipX ? Math.min(W - 70, sim.shipX + 260) : Math.max(70, sim.shipX - 260);
+    }
+  }
+  const maxStep = 1500 * dt;
+  const dx = target - sim.shipX;
+  sim.shipX += Math.max(-maxStep, Math.min(maxStep, dx));
+  sim.shipX = Math.max(60, Math.min(W - 60, sim.shipX));
+}
+
+function burst(x, y, n, color) {
+  for (let i = 0; i < n; i++) {
+    const a = rand() * Math.PI * 2, sp = 120 + rand() * 320;
+    sparks.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 120, life: 0.5 + rand() * 0.3, color });
+  }
+}
+
+function step(dt) {
+  sim.t += dt;
+  if (sim.over) {
+    sim.overT += dt;
+    if (sim.overT > 1.5) { // auto-restart so the footage never stalls
+      sim.over = false; sim.overT = 0; sim.shields = 3;
+      coins.length = 0; bugs.length = 0;
+    }
+    return;
+  }
+  if (sim.invuln > 0) sim.invuln -= dt;
+  if (sim.shake > 0) sim.shake -= dt;
+  autopilot(dt);
+
+  sim.coinTimer -= dt;
+  if (sim.coinTimer <= 0) { spawnCoin(); sim.coinTimer = 0.5; }
+  sim.bugTimer -= dt;
+  if (sim.bugTimer <= 0) { spawnBug(); sim.bugTimer = 1.1; }
+
+  const accel = 1 + sim.t * 0.004;
+  for (let i = coins.length - 1; i >= 0; i--) {
+    const c = coins[i];
+    c.y += 430 * accel * dt; c.spin += dt * 6;
+    if (c.y > H + 60) { coins.splice(i, 1); continue; }
+    const dx = c.x - sim.shipX, dy = c.y - SHIP_Y;
+    if (dx * dx + dy * dy < 78 * 78) {
+      coins.splice(i, 1);
+      sim.score += 5; sim.coins++;
+      burst(c.x, c.y, 14, "#ffd34d");
+    }
+  }
+  for (let i = bugs.length - 1; i >= 0; i--) {
+    const b = bugs[i];
+    b.y += 540 * accel * dt;
+    b.x += Math.sin(sim.t * 2 + b.phase) * b.sway * dt;
+    if (b.y > H + 70) { bugs.splice(i, 1); sim.bugsDodged++; continue; }
+    const dx = b.x - sim.shipX, dy = b.y - SHIP_Y;
+    if (sim.invuln <= 0 && dx * dx + dy * dy < 82 * 82) {
+      bugs.splice(i, 1);
+      sim.shields--; sim.invuln = 1.2; sim.shake = 0.35;
+      burst(sim.shipX, SHIP_Y, 22, "#ff4d6d");
+      if (sim.shields <= 0) { sim.over = true; sim.overT = 0; }
+    }
+  }
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s = sparks[i];
+    s.life -= dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 500 * dt;
+    if (s.life <= 0) sparks.splice(i, 1);
+  }
+  for (const st of stars) {
+    st.y += st.s * dt;
+    if (st.y > H) { st.y = -4; st.x = rand() * W; }
+  }
+}
+
+// --- drawing ---
+function drawShip(x, y, t) {
+  ctx.save();
+  ctx.translate(x, y);
+  if (sim.invuln > 0 && Math.floor(t * 12) % 2 === 0) ctx.globalAlpha = 0.35;
+  // flame
+  const fl = 34 + Math.sin(t * 30) * 10;
+  ctx.fillStyle = "#ff9f1c";
+  ctx.beginPath();
+  ctx.moveTo(-16, 52); ctx.lineTo(0, 52 + fl); ctx.lineTo(16, 52);
+  ctx.closePath(); ctx.fill();
+  // body
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.moveTo(0, -62);
+  ctx.quadraticCurveTo(30, -20, 30, 28);
+  ctx.quadraticCurveTo(30, 52, 0, 52);
+  ctx.quadraticCurveTo(-30, 52, -30, 28);
+  ctx.quadraticCurveTo(-30, -20, 0, -62);
+  ctx.fill();
+  // magenta nose + window
+  ctx.fillStyle = "#c41c83";
+  ctx.beginPath();
+  ctx.moveTo(0, -62);
+  ctx.quadraticCurveTo(22, -28, 24, -2);
+  ctx.lineTo(-24, -2);
+  ctx.quadraticCurveTo(-22, -28, 0, -62);
+  ctx.fill();
+  ctx.fillStyle = "#191419";
+  ctx.beginPath(); ctx.arc(0, 12, 13, 0, Math.PI * 2); ctx.fill();
+  // fins
+  ctx.fillStyle = "#c41c83";
+  ctx.beginPath(); ctx.moveTo(-28, 18); ctx.lineTo(-52, 54); ctx.lineTo(-28, 52); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(28, 18); ctx.lineTo(52, 54); ctx.lineTo(28, 52); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawCoin(c) {
+  const squash = Math.abs(Math.cos(c.spin));
+  ctx.save();
+  ctx.translate(c.x, c.y);
+  ctx.scale(Math.max(0.25, squash), 1);
+  ctx.fillStyle = "#ffd34d";
+  ctx.beginPath(); ctx.arc(0, 0, c.r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#e0a800";
+  ctx.beginPath(); ctx.arc(0, 0, c.r - 8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#7a5200";
+  ctx.font = "bold 40px sans-serif";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("$", 0, 2);
+  ctx.restore();
+}
+
+function drawBug(b) {
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.fillStyle = "#ff4d6d";
+  ctx.beginPath();
+  ctx.roundRect(-b.r, -b.r, b.r * 2, b.r * 2, 14);
+  ctx.fill();
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 9; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(-18, -18); ctx.lineTo(18, 18);
+  ctx.moveTo(18, -18); ctx.lineTo(-18, 18);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function draw() {
+  ctx.save();
+  if (sim.shake > 0) {
+    ctx.translate((rand() - 0.5) * 14, (rand() - 0.5) * 14);
+  }
+  // background: ink gradient + magenta glow at the bottom
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#120e12");
+  g.addColorStop(0.7, "#191419");
+  g.addColorStop(1, "#3d0f2c");
+  ctx.fillStyle = g;
+  ctx.fillRect(-20, -20, W + 40, H + 40);
+  // stars
+  ctx.fillStyle = "rgba(255,255,255,0.75)";
+  for (const st of stars) {
+    ctx.beginPath(); ctx.arc(st.x, st.y, st.r, 0, Math.PI * 2); ctx.fill();
+  }
+  // coins, bugs, sparks
+  for (const c of coins) drawCoin(c);
+  for (const b of bugs) drawBug(b);
+  for (const s of sparks) {
+    ctx.globalAlpha = Math.max(0, s.life * 2);
+    ctx.fillStyle = s.color;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // ship
+  drawShip(sim.shipX, SHIP_Y, sim.t);
+  // ground line
+  ctx.fillStyle = "#c41c83";
+  ctx.fillRect(0, H - 130, W, 6);
+  ctx.restore();
+
+  // HUD
+  ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 44px sans-serif";
+  ctx.fillText("BOUNTY RUSH", 48, 120);
+  ctx.textAlign = "right";
+  ctx.fillStyle = "#ffd34d";
+  ctx.font = "bold 76px sans-serif";
+  ctx.fillText("$" + sim.score, W - 48, 132);
+  // shields
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < sim.shields ? "#c41c83" : "rgba(255,255,255,0.18)";
+    const sx = W - 190 + i * 56, sy = 185;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - 18);
+    ctx.lineTo(sx + 18, sy - 10); ctx.lineTo(sx + 18, sy + 6);
+    ctx.quadraticCurveTo(sx + 18, sy + 22, sx, sy + 30);
+    ctx.quadraticCurveTo(sx - 18, sy + 22, sx - 18, sy + 6);
+    ctx.lineTo(sx - 18, sy - 10);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(255,255,255,0.65)";
+  ctx.font = "bold 30px sans-serif";
+  ctx.fillText("PLAYED BY THE AGENT — AUTOPILOT ON", W / 2, H - 60);
+  if (sim.over) {
+    ctx.fillStyle = "rgba(25,20,25,0.72)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 110px sans-serif";
+    ctx.fillText("GAME OVER", W / 2, H / 2 - 20);
+    ctx.fillStyle = "#ffd34d";
+    ctx.font = "bold 64px sans-serif";
+    ctx.fillText("SCORE $" + sim.score, W / 2, H / 2 + 70);
+  }
+}
+
+// --- fixed-step loop ---
+let last = performance.now();
+let acc = 0;
+const DT = 1 / 60;
+window.__sim = sim;
+window.__ready = true;
+function frame(now) {
+  let elapsed = (now - last) / 1000;
+  last = now;
+  if (elapsed > 0.25) elapsed = 0.25;
+  acc += elapsed;
+  while (acc >= DT) { step(DT); acc -= DT; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
